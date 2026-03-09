@@ -29,14 +29,15 @@ chmod +x setup_server.sh
 ```
 
 This script will automatically:
+
 1. Install Docker
 2. Clone the repo
 3. Create `.env` with secrets (pauses for you to edit)
 4. Build and start Docker containers (app + redis)
-5. Install Nginx + Let's Encrypt SSL for `pdml26.thanavarp.com`
+5. Install Nginx + Let's Encrypt SSL for `pdml26.
 6. Configure firewall
 
-After it finishes, your API is live at `https://pdml26.thanavarp.com`
+After it finishes, your API is live at `https://pdml26.domain.com`
 
 ## Manual Setup
 
@@ -47,10 +48,11 @@ After it finishes, your API is live at `https://pdml26.thanavarp.com`
 - Region: closest to your users (Singapore if Thailand)
 - Add your SSH key
 
-| Option     | Spec                 | Cost     | Use case             |
-|------------|----------------------|----------|----------------------|
-| Start here | 8 vCPU / 16GB RAM    | ~$96/mo  | Handles most traffic |
-| Scale up   | 16 vCPU / 32GB RAM   | ~$192/mo | Heavy concurrent use |
+
+| Option     | Spec               | Cost     | Use case             |
+| ------------ | -------------------- | ---------- | ---------------------- |
+| Start here | 8 vCPU / 16GB RAM  | ~$96/mo  | Handles most traffic |
+| Scale up   | 16 vCPU / 32GB RAM | ~$192/mo | Heavy concurrent use |
 
 ### 2. SSH in and setup
 
@@ -94,6 +96,7 @@ apt install -y nginx certbot python3-certbot-nginx
 ```
 
 Create Nginx config:
+
 ```bash
 cat > /etc/nginx/sites-available/api << 'EOF'
 server {
@@ -119,6 +122,7 @@ systemctl restart nginx
 ```
 
 Get SSL:
+
 ```bash
 certbot --nginx -d pdml26.thanavarp.com
 ```
@@ -137,16 +141,17 @@ ufw enable
 
 ### Environment Variables (.env)
 
-| Variable               | Description                      | Default                |
-|------------------------|----------------------------------|------------------------|
-| SECRET_KEY             | Flask secret key (random hex)    | change-me              |
-| SQLALCHEMY_DATABASE_URI| Database connection string       | sqlite:///users.db     |
-| FLASK_ENV              | Environment mode                 | production             |
-| REDIS_HOST             | Redis hostname                   | redis                  |
-| REDIS_PORT             | Redis port                       | 6379                   |
-| APP_PORT               | Exposed app port                 | 8080                   |
-| GUNICORN_WORKERS       | Number of gunicorn workers       | auto (cpu_count*2+1)   |
-| API_KEY                | API key for authentication       | (required)             |
+
+| Variable                | Description                   | Default              |
+| ------------------------- | ------------------------------- | ---------------------- |
+| SECRET_KEY              | Flask secret key (random hex) | change-me            |
+| SQLALCHEMY_DATABASE_URI | Database connection string    | sqlite:///users.db   |
+| FLASK_ENV               | Environment mode              | production           |
+| REDIS_HOST              | Redis hostname                | redis                |
+| REDIS_PORT              | Redis port                    | 6379                 |
+| APP_PORT                | Exposed app port              | 8080                 |
+| GUNICORN_WORKERS        | Number of gunicorn workers    | auto (cpu_count*2+1) |
+| API_KEY                 | API key for authentication    | (required)           |
 
 ### API Authentication
 
@@ -183,6 +188,17 @@ certbot renew --dry-run
 nano /root/pd_ml_2026/.env
 cd /root/pd_ml_2026 && docker compose restart
 ```
+
+## Update .env Only
+
+If you only changed `.env` (no code changes), just restart the containers:
+
+```bash
+nano /root/pd_ml_2026/.env
+cd /root/pd_ml_2026 && docker compose restart
+```
+
+No rebuild needed — `restart` picks up new env values.
 
 ## Fresh Reinstall
 

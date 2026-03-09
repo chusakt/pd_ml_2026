@@ -51,7 +51,8 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 
 import redis
 from flask_cors import CORS
-
+import threading
+from datetime import datetime, timezone, timedelta
 
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
@@ -79,43 +80,91 @@ successful_request_count = 0
 TELEGRAM_BOT_TOKEN = '7157013711:AAFCbxzvvpHEH2VeLyngWauxaKy4HlWTWOk'  # Replace with your bot token
 TELEGRAM_CHAT_ID = '7797940144'  # Replace with your chat ID
 
-# def send_telegram_message(message):
-#     try:
-#         telegram_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-#         payload = {
-#             'chat_id': TELEGRAM_CHAT_ID,
-#             'text': message,  # No special formatting
-#         }
-#         response = requests.post(telegram_url, json=payload)
-#         if response.status_code == 200:
-#             print("Message sent successfully via Telegram.")
-#         else:
-#             print(f"Failed to send message: {response.status_code} {response.text}")
-#     except Exception as e:
-#         print(f"Error sending message via Telegram: {e}")
+def send_telegram_message(message):
+    try:
+        telegram_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {
+            'chat_id': TELEGRAM_CHAT_ID,
+            'text': message,
+        }
+        response = requests.post(telegram_url, json=payload)
+        if response.status_code == 200:
+            print("Message sent successfully via Telegram.")
+        else:
+            print(f"Failed to send message: {response.status_code} {response.text}")
+    except Exception as e:
+        print(f"Error sending message via Telegram: {e}")
 
-last_sent_message = None  # To keep track of the last sent message
+# --- Endpoint call counter (stored in Redis, shared across workers) ---
+TRACKED_ENDPOINTS = [
+    'predict_questionaire',
+    'predict_dualtap',
+    'predict_pinchtosize',
+    'predict_tremor_rest',
+    'predict_tremor_post',
+    'predict_gait_stab',
+    'predict_gait_walk',
+    'predict_voice_ahh',
+    'predict_voice_ypl',
+    'predict_voice_ahh_mp3',
+    'predict_voice_ypl_mp3',
+    'predict_voting',
+]
 
-# def send_telegram_message(message):
-#     global last_sent_message
-#     try:
-#         # Only send the message if it's different from the last sent message
-#         if message != last_sent_message:
-#             telegram_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-#             payload = {
-#                 'chat_id': TELEGRAM_CHAT_ID,
-#                 'text': message,  # No special formatting
-#             }
-#             response = requests.post(telegram_url, json=payload)
-#             if response.status_code == 200:
-#                 print("Message sent successfully via Telegram.")
-#                 last_sent_message = message  # Update the last sent message
-#             else:
-#                 print(f"Failed to send message: {response.status_code} {response.text}")
-#         else:
-#             print("Skipped sending duplicate message.")
-#     except Exception as e:
-#         print(f"Error sending message via Telegram: {e}")
+def increment_endpoint_count(endpoint_name):
+    """Increment the daily call count for an endpoint in Redis."""
+    try:
+        redis_conn.hincrby('daily_endpoint_counts', endpoint_name, 1)
+    except Exception as e:
+        print(f"Error incrementing endpoint count: {e}")
+
+def send_daily_summary():
+    """Send daily summary of endpoint call counts via Telegram, then reset."""
+    try:
+        TH_TZ = timezone(timedelta(hours=7))
+        now = datetime.now(TH_TZ)
+        counts = redis_conn.hgetall('daily_endpoint_counts')
+
+        lines = [f"📊 สรุปการเรียกใช้ API ประจำวัน"]
+        lines.append(f"📅 {now.strftime('%Y-%m-%d %H:%M')} (เวลาไทย)")
+        lines.append("")
+
+        total = 0
+        for ep in TRACKED_ENDPOINTS:
+            count = int(counts.get(ep.encode(), counts.get(ep, 0)))
+            total += count
+            lines.append(f"  • /{ep}: {count} ครั้ง")
+
+        lines.append("")
+        lines.append(f"  รวมทั้งหมด: {total} ครั้ง")
+
+        send_telegram_message("\n".join(lines))
+
+        # Reset counts after sending
+        redis_conn.delete('daily_endpoint_counts')
+        print(f"Daily summary sent and counters reset at {now}")
+    except Exception as e:
+        print(f"Error sending daily summary: {e}")
+
+def _daily_summary_scheduler():
+    """Background thread: send summary at noon Thailand time (UTC+7) every day."""
+    TH_TZ = timezone(timedelta(hours=7))
+    TARGET_HOUR = 12  # noon
+    while True:
+        now = datetime.now(TH_TZ)
+        # Calculate next noon
+        target = now.replace(hour=TARGET_HOUR, minute=0, second=0, microsecond=0)
+        if now >= target:
+            target += timedelta(days=1)
+        wait_seconds = (target - now).total_seconds()
+        print(f"Daily summary scheduler: next run at {target}, waiting {wait_seconds:.0f}s")
+        import time
+        time.sleep(wait_seconds)
+        send_daily_summary()
+
+# Start the scheduler in a daemon thread (only once per process)
+_summary_thread = threading.Thread(target=_daily_summary_scheduler, daemon=True)
+_summary_thread.start()
 
 
 # app = Flask(__name__)
@@ -168,6 +217,10 @@ def check_api_key():
         if key != API_KEY:
             return jsonify({"error": "Unauthorized"}), 401
 
+    # Count endpoint calls (strip leading /)
+    endpoint_name = request.path.lstrip('/')
+    if endpoint_name in TRACKED_ENDPOINTS:
+        increment_endpoint_count(endpoint_name)
 
 
 CORS(
@@ -175,7 +228,7 @@ CORS(
     resources={r"/*": {"origins": [
         "http://localhost:3000",
         "http://127.0.0.1:3000",
-        "https://sea-turtle-app-wajh3.ondigitalocean.app"
+        "https://pdml26.thanavarp.com"
     ]}},
     supports_credentials=True,  # เปลี่ยนเป็น True เฉพาะกรณีใช้ cookie/session
     allow_headers=["Content-Type", "Authorization", "X-API-Key"],

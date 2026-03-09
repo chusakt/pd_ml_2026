@@ -7,3 +7,5 @@ __pycache__/
 .claude/
 note_api_key.md
 notelocal.md
+load_test.sh
+load_test_dualtap.sh

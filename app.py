@@ -228,9 +228,10 @@ CORS(
     resources={r"/*": {"origins": [
         "http://localhost:3000",
         "http://127.0.0.1:3000",
-        "https://pdml26.thanavarp.com"
+        "https://pdml26.thanavarp.com",
+        "null"
     ]}},
-    supports_credentials=True,  # เปลี่ยนเป็น True เฉพาะกรณีใช้ cookie/session
+    supports_credentials=False,  # Must be False when allowing 'null' origin
     allow_headers=["Content-Type", "Authorization", "X-API-Key"],
     methods=["GET", "POST", "OPTIONS"]
 )

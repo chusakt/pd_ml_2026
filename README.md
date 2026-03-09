@@ -183,3 +183,20 @@ certbot renew --dry-run
 nano /root/pd_ml_2026/.env
 cd /root/pd_ml_2026 && docker compose restart
 ```
+
+## Fresh Reinstall
+
+If you want to wipe everything and start over:
+
+```bash
+# Stop and remove everything
+cd /root/pd_ml_2026
+docker compose down
+
+# Delete the repo folder
+cd /root
+rm -rf pd_ml_2026
+
+# Run setup again
+./setup_server.sh
+```

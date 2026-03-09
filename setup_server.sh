@@ -23,18 +23,11 @@ cd pd_ml_2026
 
 # ---- 3. Create .env ----
 echo ""
-echo "[3/8] Creating .env file..."
-cat > .env << 'ENVFILE'
-SECRET_KEY=451802e16a13efa5da771a73158f5290556b208ba76152e82b69afe012c3e0d9
-SQLALCHEMY_DATABASE_URI=sqlite:///users.db
-FLASK_ENV=production
-REDIS_HOST=redis
-REDIS_PORT=6379
-APP_PORT=8080
-GUNICORN_WORKERS=9
-API_KEY=eOZhrh2T4fDefCNe3DoUvJkN_29hL5midsEb6zHBwwg
-ENVFILE
-echo "  .env created at /root/pd_ml_2026/.env"
+echo "[3/8] Create your .env file before continuing..."
+cp .env.example .env
+echo "  .env.example copied to .env at /root/pd_ml_2026/.env"
+echo "  Edit it now:  nano /root/pd_ml_2026/.env"
+read -p "  Press Enter after you have filled in .env..."
 
 # ---- 4. Build and start Docker ----
 echo ""

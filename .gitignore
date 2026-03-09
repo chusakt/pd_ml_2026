@@ -1,2 +1,8 @@
 *.pyc
-__pycache__/*
+__pycache__/
+.env
+*.wav
+*.mp3
+*.zip
+.claude/
+note_api_key.md

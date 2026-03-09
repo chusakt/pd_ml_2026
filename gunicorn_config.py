@@ -1,7 +1,10 @@
+import multiprocessing
+import os
+
 bind = "0.0.0.0:8080"
-workers = 9
-threads = 2 
-timeout = 300  # Increase the timeout (in seconds) to prevent timeouts
-keepalive = 5 
-preload_app = True  # Preload the app to save memory and improve performance
-worker_class = "gthread"  # Use threaded workers to optimize for I/O-bound tasks
+workers = int(os.getenv("GUNICORN_WORKERS", multiprocessing.cpu_count() * 2 + 1))
+threads = 2
+timeout = 300
+keepalive = 5
+preload_app = True
+worker_class = "gthread"

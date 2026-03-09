@@ -147,15 +147,26 @@ CORS(
     app,
     resources={r'/*': {'origins': CORS_ORIGINS}},
     supports_credentials=CORS_SUPPORTS_CREDENTIALS,
-    allow_headers=['Content-Type', 'Authorization'],
+    allow_headers=['Content-Type', 'Authorization', 'X-API-Key'],
     methods=['GET', 'POST', 'OPTIONS'],
 )
 
+# --- API Key Authentication ---
+API_KEY = os.getenv("API_KEY")
+
 @app.before_request
-def _handle_preflight_options():
-    # Ensure OPTIONS preflight always succeeds (CORS headers are added by flask-cors).
+def check_api_key():
+    # Skip preflight OPTIONS requests
     if request.method == 'OPTIONS':
         return ('', 204)
+    # Skip health check endpoint
+    if request.path == '/health':
+        return
+    # Require API key if set
+    if API_KEY:
+        key = request.headers.get("X-API-Key")
+        if key != API_KEY:
+            return jsonify({"error": "Unauthorized"}), 401
 
 
 
@@ -167,7 +178,7 @@ CORS(
         "https://sea-turtle-app-wajh3.ondigitalocean.app"
     ]}},
     supports_credentials=True,  # เปลี่ยนเป็น True เฉพาะกรณีใช้ cookie/session
-    allow_headers=["Content-Type", "Authorization"],
+    allow_headers=["Content-Type", "Authorization", "X-API-Key"],
     methods=["GET", "POST", "OPTIONS"]
 )
 
@@ -357,6 +368,10 @@ def extract_tapcount_statistics(data):
     return features
 
 # Route for the homepage
+@app.route('/health')
+def health():
+    return jsonify({"status": "ok"}), 200
+
 @app.route('/')
 def home():
     return "<h1>Welcome to god world 2</h1><p>xxxxxxxxx</p>"

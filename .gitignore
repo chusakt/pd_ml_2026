@@ -6,3 +6,4 @@ __pycache__/
 *.zip
 .claude/
 note_api_key.md
+notelocal.md

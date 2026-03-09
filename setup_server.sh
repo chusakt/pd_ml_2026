@@ -5,6 +5,10 @@ echo "========================================="
 echo "  PD ML 2026 - Server Setup Script"
 echo "========================================="
 
+read -p "Enter your domain name (e.g., pdml26.example.com): " DOMAIN
+read -p "Enter your email for SSL certificate: " EMAIL
+echo ""
+
 # ---- 1. Install Docker ----
 echo ""
 echo "[1/8] Installing Docker..."
@@ -19,18 +23,13 @@ cd pd_ml_2026
 
 # ---- 3. Create .env ----
 echo ""
-echo "[3/8] Creating .env file..."
-cat > .env << 'ENVFILE'
-SECRET_KEY=451802e16a13efa5da771a73158f5290556b208ba76152e82b69afe012c3e0d9
-SQLALCHEMY_DATABASE_URI=sqlite:///users.db
-FLASK_ENV=production
-REDIS_HOST=redis
-REDIS_PORT=6379
-APP_PORT=8080
-GUNICORN_WORKERS=9
-API_KEY=eOZhrh2T4fDefCNe3DoUvJkN_29hL5midsEb6zHBwwg
-ENVFILE
+echo "[3/8] Creating .env from template..."
+cp .env.example .env
 echo "  .env created at /root/pd_ml_2026/.env"
+echo ""
+echo "  >>> Edit .env with your secrets: nano /root/pd_ml_2026/.env"
+echo ""
+read -p "  Press ENTER after editing .env (or Ctrl+C to stop)..."
 
 # ---- 4. Build and start Docker ----
 echo ""
@@ -53,17 +52,17 @@ apt install -y nginx certbot python3-certbot-nginx
 # ---- 7. Configure Nginx ----
 echo ""
 echo "[7/8] Configuring Nginx..."
-cat > /etc/nginx/sites-available/api << 'NGINXCONF'
+cat > /etc/nginx/sites-available/api << NGINXCONF
 server {
     listen 80;
-    server_name pdml26.thanavarp.com;
+    server_name ${DOMAIN};
 
     location / {
         proxy_pass http://127.0.0.1:8080;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
         proxy_read_timeout 300s;
         proxy_connect_timeout 300s;
     }
@@ -78,7 +77,7 @@ systemctl restart nginx
 # ---- 8. SSL Certificate ----
 echo ""
 echo "[8/8] Getting SSL certificate..."
-certbot --nginx -d pdml26.thanavarp.com --non-interactive --agree-tos --email chusakt@gmail.com
+certbot --nginx -d ${DOMAIN} --non-interactive --agree-tos --email ${EMAIL}
 
 # ---- 9. Firewall ----
 echo ""
@@ -94,8 +93,8 @@ echo "========================================="
 echo "  SETUP COMPLETE!"
 echo "========================================="
 echo ""
-echo "  API URL:  https://pdml26.thanavarp.com"
-echo "  Health:   https://pdml26.thanavarp.com/health"
+echo "  API URL:  https://${DOMAIN}"
+echo "  Health:   https://${DOMAIN}/health"
 echo ""
 echo "  .env location:    /root/pd_ml_2026/.env"
 echo "  Nginx config:     /etc/nginx/sites-available/api"

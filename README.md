@@ -10,68 +10,127 @@ Flask API server with ML models for Parkinson's disease screening.
 ├── config.py               # App configuration
 ├── gunicorn_config.py      # Gunicorn server settings
 ├── requirements.txt        # Python dependencies
-├── runtime.txt             # Python version
-├── Procfile                # Process command
 ├── Dockerfile              # Docker image build
 ├── docker-compose.yml      # Docker services (app + redis)
+├── setup_server.sh         # One-command server setup script
 ├── .env.example            # Environment variables template
-├── .dockerignore           # Files excluded from Docker image
 ├── modelfromdata2024b/     # Trained ML model files (.pkl)
-├── static/                 # CSS assets
-└── .do/                    # DigitalOcean App Platform config (legacy)
+└── static/                 # CSS assets
 ```
 
-## Run with Docker
+## Quick Install on Server (one command)
 
-### Prerequisites
-- Docker & Docker Compose installed
-
-### Steps
+SSH into a fresh **Ubuntu 24.04** server and run:
 
 ```bash
-# 1. Clone the repo
-git clone https://github.com/chusakt/pd_ml_2026.git
-cd pd_ml_2026
-
-# 2. Create .env from template
-cp .env.example .env
-# Edit .env with your actual secrets
-
-# 3. Build and run
-docker compose up --build -d
-
-# 4. Check logs
-docker compose logs -f
+curl -O https://raw.githubusercontent.com/chusakt/pd_ml_2026/main/setup_server.sh
+chmod +x setup_server.sh
+./setup_server.sh
 ```
 
-App runs at `http://localhost:8080`
+This script will automatically:
+1. Install Docker
+2. Clone the repo
+3. Create `.env` with secrets (pauses for you to edit)
+4. Build and start Docker containers (app + redis)
+5. Install Nginx + Let's Encrypt SSL for `pdml26.thanavarp.com`
+6. Configure firewall
 
-## Deploy on a Droplet (or any VPS)
+After it finishes, your API is live at `https://pdml26.thanavarp.com`
 
-### Recommended server: 8 vCPU / 16GB RAM (~$96/mo)
+## Manual Setup
+
+### 1. Create a Droplet / VPS
+
+- **Ubuntu 24.04**
+- Recommended: **8 vCPU / 16GB RAM** (~$96/mo)
+- Region: closest to your users (Singapore if Thailand)
+- Add your SSH key
 
 | Option     | Spec                 | Cost     | Use case             |
 |------------|----------------------|----------|----------------------|
 | Start here | 8 vCPU / 16GB RAM    | ~$96/mo  | Handles most traffic |
 | Scale up   | 16 vCPU / 32GB RAM   | ~$192/mo | Heavy concurrent use |
 
-### Deploy
+### 2. SSH in and setup
 
 ```bash
-# 1. SSH into your server
 ssh root@your-server-ip
 
-# 2. Install Docker
+# Install Docker
 curl -fsSL https://get.docker.com | sh
 
-# 3. Clone and setup
+# Clone repo
 git clone https://github.com/chusakt/pd_ml_2026.git
 cd pd_ml_2026
-cp .env.example .env
-# Edit .env with your actual secrets
 
-# 4. Run
+# Create .env
+cp .env.example .env
+nano .env
+```
+
+### 3. Build and run
+
+```bash
 docker compose up --build -d
+```
+
+### 4. Verify
+
+```bash
+docker compose ps
+docker compose logs -f
+curl http://localhost:8080/health
+```
+
+### 5. Setup HTTPS (Nginx + Let's Encrypt)
+
+Point your domain A record to the server IP first.
+
+```bash
+# Install Nginx + Certbot
+apt update -y
+apt install -y nginx certbot python3-certbot-nginx
+```
+
+Create Nginx config:
+```bash
+cat > /etc/nginx/sites-available/api << 'EOF'
+server {
+    listen 80;
+    server_name pdml26.thanavarp.com;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 300s;
+        proxy_connect_timeout 300s;
+    }
+}
+EOF
+
+ln -sf /etc/nginx/sites-available/api /etc/nginx/sites-enabled/
+rm -f /etc/nginx/sites-enabled/default
+nginx -t
+systemctl restart nginx
+```
+
+Get SSL:
+```bash
+certbot --nginx -d pdml26.thanavarp.com
+```
+
+### 6. Firewall
+
+```bash
+ufw allow 22
+ufw allow 80
+ufw allow 443
+ufw deny 8080
+ufw enable
 ```
 
 ## Configuration
@@ -80,22 +139,47 @@ docker compose up --build -d
 
 | Variable               | Description                      | Default                |
 |------------------------|----------------------------------|------------------------|
-| SECRET_KEY             | Flask secret key                 | change-me              |
+| SECRET_KEY             | Flask secret key (random hex)    | change-me              |
 | SQLALCHEMY_DATABASE_URI| Database connection string       | sqlite:///users.db     |
 | FLASK_ENV              | Environment mode                 | production             |
-| REDIS_HOST             | Redis hostname                   | redis (via docker)     |
+| REDIS_HOST             | Redis hostname                   | redis                  |
 | REDIS_PORT             | Redis port                       | 6379                   |
 | APP_PORT               | Exposed app port                 | 8080                   |
 | GUNICORN_WORKERS       | Number of gunicorn workers       | auto (cpu_count*2+1)   |
+| API_KEY                | API key for authentication       | (required)             |
 
-### Why Docker vs Previous Setup
+### API Authentication
 
-| Setting    | Before (DO App Platform)         | Now (Docker)                          |
-|------------|----------------------------------|---------------------------------------|
-| Workers    | Hardcoded 9                      | Env var `GUNICORN_WORKERS` (default: auto) |
-| Redis      | Exposed port 6379                | Internal only                         |
-| Memory     | 32GB allocated                   | 12GB app limit, 256MB Redis           |
-| Health     | None                             | App + Redis health checks             |
-| Containers | 3 x $392/mo = $1,176/mo         | 1 container with 9 workers (~$96/mo)  |
+All requests require the `X-API-Key` header (except `/health`):
 
-Models load once via `preload_app = True`, so 1 container with 9 workers gives the same throughput as 3 containers.
+```bash
+curl -X POST https://pdml26.thanavarp.com/predict_dualtap \
+  -H "X-API-Key: your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"data": "..."}'
+```
+
+Without a valid key you get `401 Unauthorized`.
+
+## Common Commands
+
+```bash
+cd /root/pd_ml_2026
+
+# View logs
+docker compose logs -f
+
+# Restart
+docker compose restart
+
+# Rebuild after code changes
+git pull
+docker compose up --build -d
+
+# Check SSL renewal
+certbot renew --dry-run
+
+# Edit .env after setup and restart
+nano /root/pd_ml_2026/.env
+cd /root/pd_ml_2026 && docker compose restart
+```

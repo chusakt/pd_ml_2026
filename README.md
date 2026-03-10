@@ -103,6 +103,8 @@ server {
     listen 80;
     server_name pdml26.thanavarp.com;
 
+    client_max_body_size 50M;
+
     location / {
         proxy_pass http://127.0.0.1:8080;
         proxy_set_header Host $host;

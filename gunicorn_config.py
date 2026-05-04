@@ -20,15 +20,15 @@ max_requests_jitter = int(os.getenv("GUNICORN_MAX_REQUESTS_JITTER", 100))
 
 
 def post_worker_init(worker):
-    # Start the daily-summary scheduler AFTER fork in each worker. The scheduler
-    # itself uses a Redis lock so only one worker actually fires the summary.
+    # Start background schedulers AFTER fork in each worker. They use Redis
+    # locks so only one worker actually fires each scheduled task.
     # Starting threads before fork (at module import with preload_app=True) is a
     # known fork-after-thread footgun — child workers can inherit broken locks.
     try:
         import app as _app
-        _app.start_daily_summary_scheduler()
+        _app.start_background_schedulers()
     except Exception as e:
-        print(f"Failed to start daily summary scheduler: {e}")
+        print(f"Failed to start background schedulers: {e}")
 
 
 def worker_abort(worker):

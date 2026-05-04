@@ -90,7 +90,7 @@ successful_request_count = 0
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '').strip()
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '').strip()
 
-def send_telegram_message(message):
+def send_telegram_message(message, parse_mode=None):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     try:
@@ -99,6 +99,8 @@ def send_telegram_message(message):
             'chat_id': TELEGRAM_CHAT_ID,
             'text': message,
         }
+        if parse_mode:
+            payload['parse_mode'] = parse_mode
         response = requests.post(telegram_url, json=payload, timeout=5)
         if response.status_code == 200:
             print("Message sent successfully via Telegram.")
@@ -203,50 +205,81 @@ TRACKED_ENDPOINTS = [
     'predict_voting',
 ]
 
-def increment_endpoint_count(endpoint_name):
-    """Increment the daily call count for an endpoint in Redis."""
-    try:
-        redis_conn.hincrby('daily_endpoint_counts', endpoint_name, 1)
-    except Exception as e:
-        print(f"Error incrementing endpoint count: {e}")
+def send_chart_summary():
+    """Send a per-endpoint call/success summary as a Telegram bar chart.
 
-def send_daily_summary():
-    """Send daily summary of endpoint call counts via Telegram, then reset."""
+    Reads + resets `endpoint_success_counts` and `endpoint_fail_counts`. Skips
+    sending entirely if there were no calls since the last reset.
+    """
     try:
         TH_TZ = timezone(timedelta(hours=7))
         now = datetime.now(TH_TZ)
-        counts = redis_conn.hgetall('daily_endpoint_counts')
 
-        lines = [f"📊 สรุปการเรียกใช้ API ประจำวัน"]
-        lines.append(f"📅 {now.strftime('%Y-%m-%d %H:%M')} (เวลาไทย)")
-        lines.append("")
+        success = redis_conn.hgetall('endpoint_success_counts') or {}
+        failure = redis_conn.hgetall('endpoint_fail_counts') or {}
 
-        total = 0
+        def _get(d, key):
+            return int(d.get(key.encode(), d.get(key, 0)))
+
+        rows = []
+        max_total = 0
+        grand_succ = 0
+        grand_total = 0
         for ep in TRACKED_ENDPOINTS:
-            count = int(counts.get(ep.encode(), counts.get(ep, 0)))
-            total += count
-            lines.append(f"  • /{ep}: {count} ครั้ง")
+            s = _get(success, ep)
+            f = _get(failure, ep)
+            t = s + f
+            rate = (s / t * 100) if t else 0
+            rows.append((ep, s, t, rate))
+            if t > max_total:
+                max_total = t
+            grand_succ += s
+            grand_total += t
 
-        lines.append("")
-        lines.append(f"  รวมทั้งหมด: {total} ครั้ง")
+        if grand_total == 0:
+            # No traffic last hour; reset (defensive) and skip the message.
+            try:
+                redis_conn.delete('endpoint_success_counts', 'endpoint_fail_counts')
+            except Exception:
+                pass
+            print(f"Chart summary: no calls since last reset, skipping send")
+            return
 
-        send_telegram_message("\n".join(lines))
+        BAR_WIDTH = 18
+        chart_lines = []
+        # Strip the redundant "predict_" prefix to fit on a phone screen.
+        for ep, s, t, rate in rows:
+            short = ep.replace('predict_', '')
+            bar_len = round((t / max_total) * BAR_WIDTH) if max_total else 0
+            bar = '█' * bar_len + '·' * (BAR_WIDTH - bar_len)
+            chart_lines.append(f"{short:<14} {bar} {t:>3} ({rate:>5.1f}%)")
 
-        # Reset counts after sending
-        redis_conn.delete('daily_endpoint_counts')
-        print(f"Daily summary sent and counters reset at {now}")
+        grand_rate = (grand_succ / grand_total * 100) if grand_total else 0
+        text = (
+            f"📈 รายงานสรุปประจำวัน (20:00)\n"
+            f"📅 {now.strftime('%Y-%m-%d %H:%M')} (เวลาไทย)\n"
+            f"```\n"
+            + "\n".join(chart_lines)
+            + f"\n```\n"
+            f"รวม: {grand_total} ครั้ง • success {grand_rate:.1f}%"
+        )
+
+        send_telegram_message(text, parse_mode='Markdown')
+
+        try:
+            redis_conn.delete('endpoint_success_counts', 'endpoint_fail_counts')
+        except Exception:
+            pass
+        print(f"Chart summary sent at {now}: total={grand_total}, success_rate={grand_rate:.1f}%")
     except Exception as e:
-        print(f"Error sending daily summary: {e}")
+        print(f"Error sending chart summary: {e}")
 
-def _daily_summary_scheduler():
-    """Background thread: send summary at noon Thailand time (UTC+7) every day.
 
-    Uses a Redis-based daily lock so only one worker actually sends the summary,
-    even when every worker starts this loop.
-    """
-    import time
+def _chart_summary_scheduler():
+    """Background thread: fire send_chart_summary once a day at 20:00 Thai time."""
+    import time as _time
     TH_TZ = timezone(timedelta(hours=7))
-    TARGET_HOUR = 12  # noon
+    TARGET_HOUR = 20
     while True:
         try:
             now = datetime.now(TH_TZ)
@@ -254,37 +287,147 @@ def _daily_summary_scheduler():
             if now >= target:
                 target += timedelta(days=1)
             wait_seconds = (target - now).total_seconds()
-            print(f"Daily summary scheduler: next run at {target}, waiting {wait_seconds:.0f}s")
-            time.sleep(wait_seconds)
+            print(f"Chart summary scheduler: next run at {target}, waiting {wait_seconds:.0f}s")
+            _time.sleep(wait_seconds)
 
-            # Cross-worker lock: first worker to set the day's key wins.
-            lock_key = f"daily_summary_lock:{datetime.now(TH_TZ).strftime('%Y-%m-%d')}"
+            # Cross-worker lock keyed by date — only one worker actually sends.
+            lock_key = f"chart_summary_lock:{datetime.now(TH_TZ).strftime('%Y-%m-%d')}"
             try:
                 got_lock = redis_conn.set(lock_key, os.getpid(), nx=True, ex=3600)
             except Exception as e:
-                print(f"Daily summary lock check failed: {e}")
+                print(f"Chart summary lock check failed: {e}")
                 got_lock = False
             if got_lock:
-                send_daily_summary()
+                send_chart_summary()
         except Exception as e:
-            print(f"Daily summary scheduler error: {e}")
-            time.sleep(60)
+            print(f"Chart summary scheduler error: {e}")
+            _time.sleep(60)
+
+
+# --- Scheduled container restart (every midnight Thai time) ---
+# Strategy: a worker thread sleeps until midnight, sends a Telegram heads-up,
+# then SIGTERMs PID 1 (gunicorn master). The Dockerfile uses `CMD [...]` exec
+# form so PID 1 is gunicorn master; killing it triggers Docker's
+# `restart: unless-stopped` policy, which brings up a fresh container.
+
+def _trigger_restart(reason: str):
+    """Notify Telegram, then SIGTERM gunicorn master so Docker restarts the container."""
+    import time as _time
+    import signal
+    TH_TZ = timezone(timedelta(hours=7))
+    now = datetime.now(TH_TZ).strftime('%Y-%m-%d %H:%M:%S')
+    send_telegram_message(
+        f"🔄 Restarting model server\n"
+        f"📅 {now} (Thai time)\n"
+        f"Reason: {reason}"
+    )
+    _time.sleep(2)  # Give Telegram a moment to deliver before we tear down.
+    try:
+        os.kill(1, signal.SIGTERM)
+    except ProcessLookupError:
+        # Not running with PID 1 as gunicorn master (e.g. local dev) — fall back
+        # to signaling our own master process group.
+        try:
+            os.kill(os.getppid(), signal.SIGTERM)
+        except Exception as e:
+            print(f"Restart fallback SIGTERM failed: {e}")
+    except Exception as e:
+        print(f"Restart SIGTERM to PID 1 failed: {e}")
+
+
+def _midnight_restart_scheduler():
+    """Background thread: trigger a coordinated container restart at 00:00 Thai time."""
+    import time as _time
+    TH_TZ = timezone(timedelta(hours=7))
+    while True:
+        try:
+            now = datetime.now(TH_TZ)
+            target = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+            wait_seconds = (target - now).total_seconds()
+            print(f"Midnight restart scheduler: next trigger at {target}, waiting {wait_seconds:.0f}s")
+            _time.sleep(wait_seconds)
+
+            # Cross-worker lock so only one worker actually triggers the restart.
+            lock_key = f"midnight_restart_lock:{datetime.now(TH_TZ).strftime('%Y-%m-%d')}"
+            try:
+                got_lock = redis_conn.set(lock_key, os.getpid(), nx=True, ex=3600)
+            except Exception as e:
+                print(f"Midnight restart lock check failed: {e}")
+                got_lock = False
+
+            if got_lock:
+                _trigger_restart("scheduled midnight restart")
+                # We're being torn down — but loop one more time defensively.
+                _time.sleep(60)
+            else:
+                # Another worker is handling it; wait past midnight before re-looping.
+                _time.sleep(120)
+        except Exception as e:
+            print(f"Midnight restart scheduler error: {e}")
+            _time.sleep(60)
+
+
+def _container_boot_id() -> str:
+    """Stable unique id per container instance (resets on restart, not on worker recycle)."""
+    try:
+        # /proc/1/stat field 22 (1-indexed) = process start time in clock ticks since system boot.
+        # Combined with hostname this is unique per gunicorn-master start = per container start.
+        with open("/proc/1/stat") as f:
+            fields = f.read().split()
+        return f"{os.uname().nodename}:{fields[21]}"
+    except Exception:
+        # Plain Python / non-Linux fallback: just use hostname (will dedupe within one process).
+        try:
+            return os.uname().nodename
+        except Exception:
+            return "unknown-host"
+
+
+def announce_startup_once():
+    """Send a 'server started' Telegram message exactly once per container boot.
+
+    All workers call this; a Redis NX lock keyed on the master process's start
+    time ensures only one worker wins. Worker recycles do not re-announce
+    because the boot_id stays the same until the container itself restarts.
+    """
+    boot_id = _container_boot_id()
+    key = f"container_announced:{boot_id}"
+    try:
+        won = redis_conn.set(key, os.getpid(), nx=True, ex=86400)
+    except Exception as e:
+        print(f"Startup announce lock check failed: {e}")
+        return
+    if not won:
+        return
+    TH_TZ = timezone(timedelta(hours=7))
+    now = datetime.now(TH_TZ).strftime('%Y-%m-%d %H:%M:%S')
+    workers = os.getenv('GUNICORN_WORKERS', '?')
+    send_telegram_message(
+        f"✅ Model server started\n"
+        f"📅 {now} (Thai time)\n"
+        f"workers={workers}, boot_id={boot_id}"
+    )
 
 
 _scheduler_started = False
 _scheduler_lock = threading.Lock()
 
-def start_daily_summary_scheduler():
-    """Idempotent — safe to call from gunicorn post_worker_init in every worker."""
+def start_background_schedulers():
+    """Idempotent — safe to call from gunicorn post_worker_init in every worker.
+
+    Starts the midnight-restart and 20:00 chart-summary loops, and sends a
+    one-time 'server started' Telegram (Redis-coordinated).
+    """
     global _scheduler_started
     with _scheduler_lock:
-        if _scheduler_started:
-            return
-        t = threading.Thread(target=_daily_summary_scheduler, daemon=True)
-        t.start()
-        _scheduler_started = True
+        if not _scheduler_started:
+            threading.Thread(target=_midnight_restart_scheduler, daemon=True).start()
+            threading.Thread(target=_chart_summary_scheduler, daemon=True).start()
+            _scheduler_started = True
+    # Call from every worker; Redis NX lock makes it idempotent across workers.
+    announce_startup_once()
 
-# Under gunicorn the post_worker_init hook starts the scheduler after fork.
+# Under gunicorn the post_worker_init hook starts the schedulers after fork.
 # For `python app.py` / Flask dev server, the start happens at __main__ below.
 
 
@@ -339,10 +482,38 @@ def check_api_key():
         if key != API_KEY:
             return jsonify({"error": "Unauthorized"}), 401
 
-    # Count endpoint calls (strip leading /)
-    endpoint_name = request.path.lstrip('/')
-    if endpoint_name in TRACKED_ENDPOINTS:
-        increment_endpoint_count(endpoint_name)
+
+@app.after_request
+def track_endpoint_success(response):
+    """Bump per-endpoint success/fail counters for the daily 20:00 chart summary.
+
+    Success = HTTP 2xx with no `error` key and prediction != "2".
+    The "2" sentinel is used by route-level except blocks to indicate an
+    internal failure even though we still return 200 to the client.
+    """
+    try:
+        endpoint_name = (request.path or '').lstrip('/')
+        if endpoint_name not in TRACKED_ENDPOINTS:
+            return response
+
+        is_success = False
+        if 200 <= response.status_code < 300:
+            data = response.get_json(silent=True) or {}
+            if 'error' in data:
+                is_success = False
+            elif str(data.get('prediction', '')) == '2':
+                is_success = False
+            else:
+                is_success = True
+
+        try:
+            bucket = 'endpoint_success_counts' if is_success else 'endpoint_fail_counts'
+            redis_conn.hincrby(bucket, endpoint_name, 1)
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return response
 
 
 # =====================================
@@ -1190,5 +1361,5 @@ def predict_voting():
 
 # Running the app
 if __name__ == '__main__':
-    start_daily_summary_scheduler()
+    start_background_schedulers()
     app.run(debug=False)

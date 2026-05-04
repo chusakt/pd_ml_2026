@@ -544,6 +544,7 @@ _TG_HELP = (
     "/selftest — replay saved payloads on every endpoint\n"
     "/selftest <endpoint> — replay just one (e.g. predict_voice_ahh)\n"
     "/list — show which endpoints have a saved payload\n"
+    "/restart — restart the Docker container now\n"
     "/help — this help"
 )
 
@@ -568,6 +569,14 @@ def _handle_telegram_command(text: str):
     if cmd in ('/selftest', '/test'):
         threading.Thread(
             target=_run_and_report_selftest, args=(arg,), daemon=True
+        ).start()
+    elif cmd == '/restart':
+        # Run in a daemon thread so this listener call returns immediately;
+        # _trigger_restart sends its own Telegram message then SIGTERMs PID 1.
+        threading.Thread(
+            target=_trigger_restart,
+            args=("manual via Telegram /restart command",),
+            daemon=True,
         ).start()
     elif cmd == '/list':
         try:

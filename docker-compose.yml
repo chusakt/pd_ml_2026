@@ -20,6 +20,7 @@ services:
           memory: 4G
     volumes:
       - ./modelfromdata2024b:/app/modelfromdata2024b:ro
+      - test_payloads:/app/test_payloads
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/')"]
       interval: 30s
@@ -44,3 +45,4 @@ services:
 
 volumes:
   redis_data:
+  test_payloads:

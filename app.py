@@ -205,6 +205,130 @@ TRACKED_ENDPOINTS = [
     'predict_voting',
 ]
 
+# Endpoints that take a multipart file upload instead of a JSON body. Saved
+# payloads for these are raw bytes, replayed via test_client form-data.
+FILE_UPLOAD_ENDPOINTS = {'predict_voice_ahh_mp3', 'predict_voice_ypl_mp3'}
+
+# --- Saved-payload self-test ---
+# Each successful prediction saves its request payload to TEST_PAYLOADS_DIR,
+# overwriting any previous one for that endpoint. /selftest (and the Telegram
+# /selftest command) replays those payloads through the live app's test client
+# to verify each endpoint still produces a valid prediction.
+TEST_PAYLOADS_DIR = os.getenv('TEST_PAYLOADS_DIR', '/app/test_payloads')
+SELFTEST_HEADER = 'X-Selftest-Run'  # marker to skip counters during self-test
+try:
+    os.makedirs(TEST_PAYLOADS_DIR, exist_ok=True)
+except Exception as e:
+    print(f"Could not create {TEST_PAYLOADS_DIR}: {e}")
+
+
+def _save_test_payload(endpoint: str, kind: str, data) -> None:
+    """Persist the newest successful payload for an endpoint.
+
+    kind='json' → data is a dict, written as UTF-8 JSON.
+    kind='file' → data is raw bytes, written as a binary blob.
+    """
+    try:
+        if kind == 'json':
+            path = os.path.join(TEST_PAYLOADS_DIR, f"{endpoint}.json")
+            tmp = path + ".tmp"
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(data, f)
+            os.replace(tmp, path)
+        elif kind == 'file':
+            path = os.path.join(TEST_PAYLOADS_DIR, f"{endpoint}.bin")
+            tmp = path + ".tmp"
+            with open(tmp, 'wb') as f:
+                f.write(data)
+            os.replace(tmp, path)
+    except Exception as e:
+        print(f"Failed to save test payload for {endpoint}: {e}")
+
+
+def run_selftest(target=None) -> dict:
+    """Replay saved payloads through Flask's test client. Returns per-endpoint dict.
+
+    target=None → run every TRACKED_ENDPOINTS.
+    target='predict_voice_ahh' → just that one.
+    """
+    import time as _time
+    import io
+    targets = [target] if target else list(TRACKED_ENDPOINTS)
+    results = {}
+    client = app.test_client()
+    headers = {SELFTEST_HEADER: '1'}
+    if API_KEY:
+        headers['X-API-Key'] = API_KEY
+
+    for ep in targets:
+        if ep not in TRACKED_ENDPOINTS:
+            results[ep] = {'status': 'unknown_endpoint'}
+            continue
+
+        is_file = ep in FILE_UPLOAD_ENDPOINTS
+        path = os.path.join(
+            TEST_PAYLOADS_DIR,
+            f"{ep}.bin" if is_file else f"{ep}.json",
+        )
+        if not os.path.exists(path):
+            results[ep] = {'status': 'no_payload'}
+            continue
+
+        try:
+            t0 = _time.time()
+            if is_file:
+                with open(path, 'rb') as f:
+                    blob = f.read()
+                resp = client.post(
+                    f'/{ep}',
+                    data={'file': (io.BytesIO(blob), 'replay.mp3')},
+                    content_type='multipart/form-data',
+                    headers=headers,
+                )
+            else:
+                with open(path, 'r', encoding='utf-8') as f:
+                    body = json.load(f)
+                resp = client.post(f'/{ep}', json=body, headers=headers)
+            elapsed_ms = int((_time.time() - t0) * 1000)
+            data = resp.get_json(silent=True) or {}
+            ok = (
+                200 <= resp.status_code < 300
+                and 'error' not in data
+                and str(data.get('prediction', '')) != '2'
+            )
+            results[ep] = {
+                'status': 'ok' if ok else 'fail',
+                'http': resp.status_code,
+                'prediction': data.get('prediction'),
+                'error': data.get('error'),
+                'time_ms': elapsed_ms,
+            }
+        except Exception as e:
+            results[ep] = {'status': 'error', 'error': str(e)}
+
+    return results
+
+
+def _format_selftest_results(results: dict) -> str:
+    lines = ["🔧 Self-test results"]
+    for ep, r in results.items():
+        st = r.get('status')
+        if st == 'ok':
+            lines.append(f"✅ {ep} ({r.get('time_ms', '?')}ms) → {r.get('prediction')}")
+        elif st == 'fail':
+            err = r.get('error') or f"prediction={r.get('prediction')}"
+            lines.append(f"❌ {ep} ({r.get('time_ms', '?')}ms) → {err}")
+        elif st == 'no_payload':
+            lines.append(f"⚠️ {ep} — no saved payload yet")
+        elif st == 'unknown_endpoint':
+            lines.append(f"❓ {ep} — not tracked")
+        elif st == 'error':
+            lines.append(f"💥 {ep} — {r.get('error')}")
+        else:
+            lines.append(f"? {ep} — {st}")
+    return "\n".join(lines)
+
+
 def send_chart_summary():
     """Send a per-endpoint call/success summary as a Telegram bar chart.
 
@@ -409,20 +533,140 @@ def announce_startup_once():
     )
 
 
+# --- Telegram command listener (long-polling) ---
+# Lets you trigger /selftest from Telegram. A Redis lock ensures only one
+# worker actually polls Telegram, so we don't get duplicate processing.
+TELEGRAM_POLLER_LOCK_KEY = "telegram_poller_lock"
+TELEGRAM_POLLER_LOCK_TTL = 120  # seconds
+
+_TG_HELP = (
+    "Commands:\n"
+    "/selftest — replay saved payloads on every endpoint\n"
+    "/selftest <endpoint> — replay just one (e.g. predict_voice_ahh)\n"
+    "/list — show which endpoints have a saved payload\n"
+    "/help — this help"
+)
+
+
+def _run_and_report_selftest(target):
+    """Run self-test in a thread so the Telegram listener can keep polling."""
+    try:
+        send_telegram_message(
+            f"🔧 Running self-test{(' for ' + target) if target else ' (all endpoints)'}..."
+        )
+        results = run_selftest(target)
+        send_telegram_message(_format_selftest_results(results))
+    except Exception as e:
+        send_telegram_message(f"Self-test crashed: {e}")
+
+
+def _handle_telegram_command(text: str):
+    parts = text.strip().split(maxsplit=1)
+    cmd = parts[0].lower()
+    arg = parts[1].strip() if len(parts) > 1 else None
+
+    if cmd in ('/selftest', '/test'):
+        threading.Thread(
+            target=_run_and_report_selftest, args=(arg,), daemon=True
+        ).start()
+    elif cmd == '/list':
+        try:
+            files = sorted(os.listdir(TEST_PAYLOADS_DIR))
+        except Exception as e:
+            send_telegram_message(f"Error listing payloads: {e}")
+            return
+        if not files:
+            send_telegram_message("No saved test payloads yet.")
+        else:
+            send_telegram_message("Saved payloads:\n" + "\n".join(files))
+    elif cmd in ('/help', '/start'):
+        send_telegram_message(_TG_HELP)
+    else:
+        send_telegram_message(f"Unknown command: {cmd}\n\n{_TG_HELP}")
+
+
+def _telegram_bot_listener():
+    """Long-poll Telegram for commands. One worker holds the poll lock at a time.
+
+    Authorization: only messages from chat_id == TELEGRAM_CHAT_ID are processed.
+    Anyone else sending the bot a message is silently ignored.
+    """
+    import time as _time
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Telegram listener: no token/chat_id, not starting")
+        return
+
+    offset = 0
+    have_lock = False
+    while True:
+        try:
+            if not have_lock:
+                got = redis_conn.set(
+                    TELEGRAM_POLLER_LOCK_KEY,
+                    os.getpid(),
+                    nx=True,
+                    ex=TELEGRAM_POLLER_LOCK_TTL,
+                )
+                if not got:
+                    _time.sleep(TELEGRAM_POLLER_LOCK_TTL // 2)
+                    continue
+                have_lock = True
+                print(f"Telegram listener: pid {os.getpid()} acquired poller lock")
+
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+            resp = requests.get(
+                url,
+                params={'offset': offset, 'timeout': 25},
+                timeout=30,
+            )
+            try:
+                redis_conn.expire(TELEGRAM_POLLER_LOCK_KEY, TELEGRAM_POLLER_LOCK_TTL)
+            except Exception:
+                pass
+
+            if resp.status_code != 200:
+                print(f"Telegram getUpdates {resp.status_code}: {resp.text[:200]}")
+                _time.sleep(10)
+                continue
+
+            data = resp.json()
+            for update in data.get('result', []):
+                offset = update['update_id'] + 1
+                msg = update.get('message') or update.get('channel_post') or {}
+                text = msg.get('text', '') or ''
+                from_chat = (msg.get('chat') or {}).get('id')
+                if str(from_chat) != str(TELEGRAM_CHAT_ID):
+                    continue
+                if text.startswith('/'):
+                    try:
+                        _handle_telegram_command(text)
+                    except Exception as e:
+                        send_telegram_message(f"Command error: {e}")
+
+        except requests.exceptions.RequestException as e:
+            print(f"Telegram listener network error: {e}")
+            have_lock = False  # release lock implicitly via TTL
+            _time.sleep(10)
+        except Exception as e:
+            print(f"Telegram listener error: {e}")
+            _time.sleep(30)
+
+
 _scheduler_started = False
 _scheduler_lock = threading.Lock()
 
 def start_background_schedulers():
     """Idempotent — safe to call from gunicorn post_worker_init in every worker.
 
-    Starts the midnight-restart and 20:00 chart-summary loops, and sends a
-    one-time 'server started' Telegram (Redis-coordinated).
+    Starts the midnight-restart loop, the 20:00 chart-summary loop, and the
+    Telegram command listener. Sends a one-time 'server started' Telegram.
     """
     global _scheduler_started
     with _scheduler_lock:
         if not _scheduler_started:
             threading.Thread(target=_midnight_restart_scheduler, daemon=True).start()
             threading.Thread(target=_chart_summary_scheduler, daemon=True).start()
+            threading.Thread(target=_telegram_bot_listener, daemon=True).start()
             _scheduler_started = True
     # Call from every worker; Redis NX lock makes it idempotent across workers.
     announce_startup_once()
@@ -485,15 +729,17 @@ def check_api_key():
 
 @app.after_request
 def track_endpoint_success(response):
-    """Bump per-endpoint success/fail counters for the daily 20:00 chart summary.
+    """Bump per-endpoint success/fail counters AND save the latest successful
+    request payload for self-test replay.
 
-    Success = HTTP 2xx with no `error` key and prediction != "2".
-    The "2" sentinel is used by route-level except blocks to indicate an
-    internal failure even though we still return 200 to the client.
+    Self-test replays carry the X-Selftest-Run header and are excluded from
+    counters and payload capture (they replay an already-saved payload).
     """
     try:
         endpoint_name = (request.path or '').lstrip('/')
         if endpoint_name not in TRACKED_ENDPOINTS:
+            return response
+        if request.headers.get(SELFTEST_HEADER) == '1':
             return response
 
         is_success = False
@@ -511,6 +757,21 @@ def track_endpoint_success(response):
             redis_conn.hincrby(bucket, endpoint_name, 1)
         except Exception:
             pass
+
+        # Save the newest successful JSON payload for self-test replay.
+        # File-upload endpoints save themselves inside the route because the
+        # multipart stream is consumed by the time we get here.
+        if (
+            is_success
+            and endpoint_name not in FILE_UPLOAD_ENDPOINTS
+            and request.is_json
+        ):
+            try:
+                req_body = request.get_json(silent=True)
+                if req_body is not None:
+                    _save_test_payload(endpoint_name, 'json', req_body)
+            except Exception:
+                pass
     except Exception:
         pass
     return response
@@ -718,6 +979,41 @@ def home():
 @app.route('/about')
 def about():
     return "<h1>About Page</h1><p>This is a simple Flask web app!</p>"
+
+
+@app.route('/selftest', methods=['POST'])
+def selftest_endpoint():
+    """Replay the saved payload(s) and return per-endpoint pass/fail.
+
+    Body / query: optional `endpoint` to test just one. Otherwise tests all.
+    Self-test calls are excluded from chart counters and payload-capture
+    (they carry the X-Selftest-Run header internally).
+    """
+    target = request.args.get('endpoint')
+    if not target and request.is_json:
+        target = (request.get_json(silent=True) or {}).get('endpoint')
+    return jsonify(run_selftest(target))
+
+
+@app.route('/saved_payloads', methods=['GET'])
+def saved_payloads_endpoint():
+    try:
+        files = sorted(os.listdir(TEST_PAYLOADS_DIR))
+    except Exception as e:
+        return jsonify({"error": str(e), "files": []}), 500
+    out = []
+    for fn in files:
+        full = os.path.join(TEST_PAYLOADS_DIR, fn)
+        try:
+            st = os.stat(full)
+            out.append({
+                "file": fn,
+                "size_bytes": st.st_size,
+                "mtime": int(st.st_mtime),
+            })
+        except Exception:
+            out.append({"file": fn})
+    return jsonify({"payloads": out})
 
 # Route to receive JSON data and make predictions
 @app.route('/predict_dualtap', methods=['POST'])
@@ -1305,6 +1601,15 @@ def predict_voice_mp3():
             y_pred = model_voice_YPL.predict(X_test)
         else:
             return jsonify({"error": "Unknown endpoint"}), 400
+
+        # Save the uploaded MP3 as the latest payload for self-test replay
+        # (only on success; skip during self-test runs to avoid recursion).
+        if request.headers.get(SELFTEST_HEADER) != '1':
+            try:
+                with open(mp3_path, 'rb') as _f:
+                    _save_test_payload(request.path.lstrip('/'), 'file', _f.read())
+            except Exception:
+                pass
 
         return jsonify({"prediction": str(y_pred[0])})
 

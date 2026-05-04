@@ -144,16 +144,24 @@ ufw enable
 ### Environment Variables (.env)
 
 
-| Variable                | Description                   | Default              |
-| ------------------------- | ------------------------------- | ---------------------- |
-| SECRET_KEY              | Flask secret key (random hex) | change-me            |
-| SQLALCHEMY_DATABASE_URI | Database connection string    | sqlite:///users.db   |
-| FLASK_ENV               | Environment mode              | production           |
-| REDIS_HOST              | Redis hostname                | redis                |
-| REDIS_PORT              | Redis port                    | 6379                 |
-| APP_PORT                | Exposed app port              | 8080                 |
-| GUNICORN_WORKERS        | Number of gunicorn workers    | auto (cpu_count*2+1) |
-| API_KEY                 | API key for authentication    | (required)           |
+| Variable                     | Description                                            | Default            |
+| ---------------------------- | ------------------------------------------------------ | ------------------ |
+| SECRET_KEY                   | Flask secret key (random hex)                          | change-me          |
+| SQLALCHEMY_DATABASE_URI      | Database connection string                             | sqlite:///users.db |
+| FLASK_ENV                    | Environment mode                                       | production         |
+| REDIS_HOST                   | Redis hostname                                         | redis              |
+| REDIS_PORT                   | Redis port                                             | 6379               |
+| APP_PORT                     | Exposed app port                                       | 8080               |
+| GUNICORN_WORKERS             | Number of gunicorn workers                             | 3                  |
+| GUNICORN_MAX_REQUESTS        | Recycle a worker after N requests                      | 500                |
+| GUNICORN_MAX_REQUESTS_JITTER | Random jitter added to max_requests                    | 100                |
+| API_KEY                      | API key for authentication                             | (required)         |
+| TELEGRAM_BOT_TOKEN           | Bot token for alerts + commands                        | (optional)         |
+| TELEGRAM_CHAT_ID             | Chat ID to send to / accept commands from             | (optional)         |
+| TELEGRAM_ERROR_BOT_TOKEN     | Separate bot for error alerts                         | falls back to main |
+| TELEGRAM_ERROR_CHAT_ID       | Separate chat for error alerts                        | falls back to main |
+| ERROR_ALERT_THROTTLE_SECONDS | Min seconds between alerts of the same error type     | 300                |
+| TEST_PAYLOADS_DIR            | Where saved self-test payloads live (mounted volume)  | /app/test_payloads |
 
 ### API Authentication
 
@@ -167,6 +175,61 @@ curl -X POST https://pdml26.thanavarp.com/predict_dualtap \
 ```
 
 Without a valid key you get `401 Unauthorized`.
+
+## Telegram Bot
+
+Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in `.env` to enable Telegram features.
+The bot must be `/start`-ed by your account (or added to the group) before it can send to that chat.
+
+### Automatic notifications you'll receive
+
+| When                      | What                                                                           |
+| ------------------------- | ------------------------------------------------------------------------------ |
+| Container starts          | `✅ Model server started` (once per boot — workers recycling won't re-announce) |
+| Daily, **20:00** Thai     | `📈 รายงานสรุปประจำวัน` — bar chart of calls per endpoint with success%        |
+| Daily, **00:00** Thai     | `🔄 Restarting model server` — heads-up before scheduled container restart    |
+| Any unhandled error       | `🚨 API Error: <endpoint>:<ExceptionType>` with traceback (per-type throttled) |
+| Worker timeout / kill     | `🚨 worker_abort` — stuck request likely hit the 300s gunicorn timeout         |
+
+The 20:00 summary is skipped if no endpoints were called that day. Error alerts of the same type are
+throttled to one every 5 min (configurable via `ERROR_ALERT_THROTTLE_SECONDS`); suppressed errors are
+counted and appended to the next alert.
+
+### Commands you can send to the bot
+
+Only messages from the configured `TELEGRAM_CHAT_ID` are processed; anyone else is ignored.
+
+| Command                       | What it does                                                                |
+| ----------------------------- | --------------------------------------------------------------------------- |
+| `/help`                       | Show available commands                                                     |
+| `/list`                       | List which endpoints have a saved payload available for replay              |
+| `/selftest`                   | Replay saved payloads on every endpoint, report ✅ / ❌ / ⚠️ + timing per ep |
+| `/selftest <endpoint>`        | Replay a single endpoint, e.g. `/selftest predict_voice_ahh`                |
+
+### How saved payloads work
+
+Every successful prediction has its request body saved to `/app/test_payloads/<endpoint>.{json,bin}`
+(one file per endpoint, overwritten each time). `/selftest` replays those payloads through the live
+app's test client — handy for spot-checking that a model still works after a deploy or restart.
+
+The `test_payloads` Docker volume keeps saved payloads across container restarts (including the
+scheduled midnight one). On a brand-new deploy, no payloads exist yet — make at least one real
+call to each endpoint before running `/selftest`.
+
+You can also trigger self-test over HTTP (handy from a script):
+
+```bash
+# All endpoints
+curl -X POST https://pdml26.thanavarp.com/selftest \
+  -H "X-API-Key: your-api-key"
+
+# One endpoint
+curl -X POST "https://pdml26.thanavarp.com/selftest?endpoint=predict_voice_ahh" \
+  -H "X-API-Key: your-api-key"
+
+# List saved payloads with sizes / mtimes
+curl https://pdml26.thanavarp.com/saved_payloads -H "X-API-Key: your-api-key"
+```
 
 ## Common Commands
 

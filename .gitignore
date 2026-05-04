@@ -7,9 +7,9 @@ __pycache__/
 .claude/
 note_api_key.md
 notelocal.md
-load_test.sh
-load_test_dualtap.sh
-load_test_voice_ahh.sh
-load_test_voice_ahh_payload.json
+loadtest/
+load_test*.sh
+load_test*_payload.json
+test_payload_*.json
 test_api.html
 testWebAppNote.md

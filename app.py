@@ -57,8 +57,17 @@ from datetime import datetime, timezone, timedelta
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
-# Use Docker's service name as the Redis host
-redis_conn = redis.Redis(host=os.getenv('REDIS_HOST', 'localhost'), port=int(os.getenv('REDIS_PORT', 6379)))
+# Use Docker's service name as the Redis host.
+# Socket timeouts are critical: without them, a Redis hiccup blocks every
+# request thread indefinitely in before_request, and the whole server hangs.
+redis_conn = redis.Redis(
+    host=os.getenv('REDIS_HOST', 'localhost'),
+    port=int(os.getenv('REDIS_PORT', 6379)),
+    socket_timeout=2,
+    socket_connect_timeout=2,
+    health_check_interval=30,
+    retry_on_timeout=False,
+)
 
 
 
@@ -76,24 +85,107 @@ request_count = 0  # Initialize request counter
 # Global variable to track successful requests
 successful_request_count = 0
 
-# Replace Line configuration with Telegram configuration
-TELEGRAM_BOT_TOKEN = '7157013711:AAFCbxzvvpHEH2VeLyngWauxaKy4HlWTWOk'  # Replace with your bot token
-TELEGRAM_CHAT_ID = '7797940144'  # Replace with your chat ID
+# Telegram credentials come from .env (TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID).
+# If TELEGRAM_BOT_TOKEN is unset, both daily summaries and error alerts no-op.
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '').strip()
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '').strip()
 
 def send_telegram_message(message):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
     try:
         telegram_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {
             'chat_id': TELEGRAM_CHAT_ID,
             'text': message,
         }
-        response = requests.post(telegram_url, json=payload)
+        response = requests.post(telegram_url, json=payload, timeout=5)
         if response.status_code == 200:
             print("Message sent successfully via Telegram.")
         else:
             print(f"Failed to send message: {response.status_code} {response.text}")
     except Exception as e:
         print(f"Error sending message via Telegram: {e}")
+
+
+# --- Error-alert Telegram bot ---
+# By default reuses the main TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID. To send
+# error alerts to a separate bot/chat, set TELEGRAM_ERROR_BOT_TOKEN and/or
+# TELEGRAM_ERROR_CHAT_ID in .env.
+TELEGRAM_ERROR_BOT_TOKEN = os.getenv('TELEGRAM_ERROR_BOT_TOKEN', '').strip() or TELEGRAM_BOT_TOKEN
+TELEGRAM_ERROR_CHAT_ID = os.getenv('TELEGRAM_ERROR_CHAT_ID', '').strip() or TELEGRAM_CHAT_ID
+ERROR_ALERT_THROTTLE_SECONDS = int(os.getenv('ERROR_ALERT_THROTTLE_SECONDS', 300))
+
+
+def send_error_alert(error_type: str, detail: str):
+    """Send an error alert via the dedicated error bot, with per-type throttling.
+
+    Why throttle: if an endpoint starts erroring on every request, sending one
+    Telegram message per error would flood the chat AND hit Telegram's per-bot
+    rate limits. Within the throttle window, suppressed errors are counted and
+    the count is appended to the next alert.
+    """
+    if not TELEGRAM_ERROR_BOT_TOKEN or not TELEGRAM_ERROR_CHAT_ID:
+        return
+    try:
+        throttle_key = f"error_alert_throttle:{error_type}"
+        count_key = f"error_alert_count:{error_type}"
+        try:
+            got_slot = redis_conn.set(
+                throttle_key, '1', nx=True, ex=ERROR_ALERT_THROTTLE_SECONDS
+            )
+        except Exception:
+            # If Redis is down, alert anyway — that's exactly when we need to know.
+            got_slot = True
+
+        if not got_slot:
+            try:
+                redis_conn.incr(count_key)
+                redis_conn.expire(count_key, ERROR_ALERT_THROTTLE_SECONDS)
+            except Exception:
+                pass
+            return
+
+        suppressed = 0
+        try:
+            v = redis_conn.get(count_key)
+            if v:
+                suppressed = int(v)
+            redis_conn.delete(count_key)
+        except Exception:
+            pass
+
+        TH_TZ = timezone(timedelta(hours=7))
+        now = datetime.now(TH_TZ).strftime('%Y-%m-%d %H:%M:%S')
+        text = (
+            f"🚨 API Error: {error_type}\n"
+            f"🕒 {now} (Thai time)\n"
+            f"pid={os.getpid()}\n\n"
+            f"{detail[:3500]}"
+        )
+        if suppressed:
+            mins = ERROR_ALERT_THROTTLE_SECONDS // 60
+            text += f"\n\n(+{suppressed} more of this type suppressed in last {mins} min)"
+
+        telegram_url = f"https://api.telegram.org/bot{TELEGRAM_ERROR_BOT_TOKEN}/sendMessage"
+        requests.post(
+            telegram_url,
+            json={'chat_id': TELEGRAM_ERROR_CHAT_ID, 'text': text},
+            timeout=5,
+        )
+    except Exception as e:
+        # Never let alerting break a request.
+        print(f"send_error_alert failed: {e}")
+
+
+def report_route_error(endpoint: str, exc: Exception):
+    """Capture traceback and alert. Call from route-level except blocks."""
+    import traceback
+    tb = traceback.format_exc()
+    send_error_alert(
+        error_type=f"{endpoint}:{type(exc).__name__}",
+        detail=f"{endpoint} raised {type(exc).__name__}: {exc}\n\n{tb}",
+    )
 
 # --- Endpoint call counter (stored in Redis, shared across workers) ---
 TRACKED_ENDPOINTS = [
@@ -147,24 +239,53 @@ def send_daily_summary():
         print(f"Error sending daily summary: {e}")
 
 def _daily_summary_scheduler():
-    """Background thread: send summary at noon Thailand time (UTC+7) every day."""
+    """Background thread: send summary at noon Thailand time (UTC+7) every day.
+
+    Uses a Redis-based daily lock so only one worker actually sends the summary,
+    even when every worker starts this loop.
+    """
+    import time
     TH_TZ = timezone(timedelta(hours=7))
     TARGET_HOUR = 12  # noon
     while True:
-        now = datetime.now(TH_TZ)
-        # Calculate next noon
-        target = now.replace(hour=TARGET_HOUR, minute=0, second=0, microsecond=0)
-        if now >= target:
-            target += timedelta(days=1)
-        wait_seconds = (target - now).total_seconds()
-        print(f"Daily summary scheduler: next run at {target}, waiting {wait_seconds:.0f}s")
-        import time
-        time.sleep(wait_seconds)
-        send_daily_summary()
+        try:
+            now = datetime.now(TH_TZ)
+            target = now.replace(hour=TARGET_HOUR, minute=0, second=0, microsecond=0)
+            if now >= target:
+                target += timedelta(days=1)
+            wait_seconds = (target - now).total_seconds()
+            print(f"Daily summary scheduler: next run at {target}, waiting {wait_seconds:.0f}s")
+            time.sleep(wait_seconds)
 
-# Start the scheduler in a daemon thread (only once per process)
-_summary_thread = threading.Thread(target=_daily_summary_scheduler, daemon=True)
-_summary_thread.start()
+            # Cross-worker lock: first worker to set the day's key wins.
+            lock_key = f"daily_summary_lock:{datetime.now(TH_TZ).strftime('%Y-%m-%d')}"
+            try:
+                got_lock = redis_conn.set(lock_key, os.getpid(), nx=True, ex=3600)
+            except Exception as e:
+                print(f"Daily summary lock check failed: {e}")
+                got_lock = False
+            if got_lock:
+                send_daily_summary()
+        except Exception as e:
+            print(f"Daily summary scheduler error: {e}")
+            time.sleep(60)
+
+
+_scheduler_started = False
+_scheduler_lock = threading.Lock()
+
+def start_daily_summary_scheduler():
+    """Idempotent — safe to call from gunicorn post_worker_init in every worker."""
+    global _scheduler_started
+    with _scheduler_lock:
+        if _scheduler_started:
+            return
+        t = threading.Thread(target=_daily_summary_scheduler, daemon=True)
+        t.start()
+        _scheduler_started = True
+
+# Under gunicorn the post_worker_init hook starts the scheduler after fork.
+# For `python app.py` / Flask dev server, the start happens at __main__ below.
 
 
 # app = Flask(__name__)
@@ -224,19 +345,6 @@ def check_api_key():
         increment_endpoint_count(endpoint_name)
 
 
-CORS(
-    app,
-    resources={r"/*": {"origins": [
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "https://pdml26.thanavarp.com"
-    ]}},
-    supports_credentials=True,  # เปลี่ยนเป็น True เฉพาะกรณีใช้ cookie/session
-    allow_headers=["Content-Type", "Authorization", "X-API-Key"],
-    methods=["GET", "POST", "OPTIONS"]
-)
-
-
 # =====================================
 
 
@@ -274,6 +382,10 @@ def handle_http_exception(e):
 
 @app.errorhandler(Exception)
 def handle_generic_exception(e):
+    try:
+        report_route_error(request.path or 'unknown', e)
+    except Exception:
+        pass
     response = {
         "status": 500,
         "message": "An unexpected error occurred."
@@ -342,6 +454,7 @@ def predict_questionaire():
                 return jsonify({"prediction": "0"})
 
     except Exception as e:
+        report_route_error('predict_questionaire', e)
         return jsonify({"error": str(e), "prediction": "2"})
 
 
@@ -475,9 +588,8 @@ def predict_dualtap():
                     
         return jsonify(response)
 
-    # except Exception as e:
-    #     return jsonify({"error": str(e)}), 400
     except Exception as e:
+        report_route_error('predict_dualtap', e)
         return jsonify({"error": str(e), "prediction": "2"})
 
 
@@ -668,10 +780,9 @@ def predict_pinchtosize():
 
         return jsonify(response)
 
-    # except Exception as e:
-    #     return jsonify({"error": str(e)}), 400
     except Exception as e:
-        return jsonify({"error": str(e), "prediction": "2"})    
+        report_route_error('predict_pinchtosize', e)
+        return jsonify({"error": str(e), "prediction": "2"})
 
 # Sampling rate (10 Hz)
 sampling_rate = 10.0
@@ -789,12 +900,11 @@ def predict_tremor():
         # # Reset the counter after 1,000 successful requests
         # if successful_request_count >= 1000:
         #     send_telegram_message(f"Reached {successful_request_count} successful predictions. Resetting the counter.")
-        #     successful_request_count = 0        
+        #     successful_request_count = 0
         return jsonify(response)
 
-    # except Exception as e:
-    #     return jsonify({"error": str(e)}), 400
     except Exception as e:
+        report_route_error(request.path.lstrip('/') or 'predict_tremor', e)
         return jsonify({"error": str(e), "prediction": "2"})
 
 
@@ -956,9 +1066,8 @@ def predict_voice():
 
         return jsonify(response)
 
-    # except Exception as e:
-    #     return jsonify({"error": str(e)}), 400
     except Exception as e:
+        report_route_error(request.path.lstrip('/') or 'predict_voice', e)
         return jsonify({"error": str(e), "prediction": "2"})
     finally:
         # Ensure the temporary WAV file is deleted after processing
@@ -993,51 +1102,32 @@ def convert_mp3_to_wav(mp3_path, wav_path):
 @app.route('/predict_voice_ahh_mp3', methods=['POST'])
 @app.route('/predict_voice_ypl_mp3', methods=['POST'])
 def predict_voice_mp3():
+    temp_folder = None
     try:
-        # send_text("App called: predict_voice_mp3")
-        # send_telegram_message("App called: predict_voice_mp3")
-        
-        # Check if 'file' key is present in the files of the request
         if 'file' not in request.files:
             return jsonify({"error": "No file part in the request"}), 400
-        
-        # Get the uploaded MP3 file
+
         file = request.files['file']
-        
-        # Generate a unique temporary folder
+
         temp_folder = f"temp_files_{uuid.uuid4()}"
         os.makedirs(temp_folder, exist_ok=True)
-        
-        # Save the uploaded MP3 file
+
         mp3_path = os.path.join(temp_folder, "uploaded.mp3")
         file.save(mp3_path)
-        
-        # Generate a temporary WAV file name
+
         temp_wav_file = os.path.join(temp_folder, f"temp_decoded_{uuid.uuid4()}.wav")
-        
-        # Convert MP3 to WAV
+
         convert_mp3_to_wav(mp3_path, temp_wav_file)
-        
-        # Measure pitch and formants from the WAV file
+
         pitch_features = measurePitch(temp_wav_file, f0min=75, f0max=300, unit="Hertz")
-        
-        # Measure formants
         formant_medians_means = measureFormants(temp_wav_file, f0min=75, f0max=300)
-        
-        # Split formant medians and means
         formant_medians = formant_medians_means[:4]
         formant_means = formant_medians_means[4:]
-        
-        # Calculate additional features
         additional_features = calculate_additional_features(*formant_medians)
-        
-        # Merge all extracted features into a single list
         all_features = pitch_features + formant_medians + formant_means + additional_features
-        
-        # Prepare features for model prediction
-        X_test = np.array(all_features[1:]).reshape(1, -1)  # Exclude "Duration" for model input
-        
-        # Select the model based on the endpoint
+
+        X_test = np.array(all_features[1:]).reshape(1, -1)
+
         if request.path == '/predict_voice_ahh_mp3':
             y_pred = model_voice_AHH.predict(X_test)
         elif request.path == '/predict_voice_ypl_mp3':
@@ -1045,20 +1135,20 @@ def predict_voice_mp3():
         else:
             return jsonify({"error": "Unknown endpoint"}), 400
 
-        # Create the response with the prediction
-        response = {
-            "prediction": str(y_pred[0]),
-        }
-
-        # Clean up temporary files
-        os.remove(temp_wav_file)
-        os.remove(mp3_path)
-        os.rmdir(temp_folder)
-        # send_text(response)
-        return jsonify(response)
+        return jsonify({"prediction": str(y_pred[0])})
 
     except Exception as e:
+        report_route_error(request.path.lstrip('/') or 'predict_voice_mp3', e)
         return jsonify({"error": str(e), "prediction": "2"}), 400
+    finally:
+        # Always clean up — on success AND on every error path. Otherwise
+        # temp_files_* folders accumulate forever and eventually fill the disk.
+        if temp_folder and os.path.isdir(temp_folder):
+            import shutil
+            try:
+                shutil.rmtree(temp_folder, ignore_errors=True)
+            except Exception:
+                pass
     
     
 
@@ -1094,9 +1184,11 @@ def predict_voting():
             return jsonify({"prediction": prediction})
 
     except Exception as e:
+        report_route_error('predict_voting', e)
         return jsonify({"error": str(e), "prediction": "2"})
 
 
 # Running the app
 if __name__ == '__main__':
+    start_daily_summary_scheduler()
     app.run(debug=False)

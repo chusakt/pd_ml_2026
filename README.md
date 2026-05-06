@@ -205,7 +205,10 @@ Only messages from the configured `TELEGRAM_CHAT_ID` are processed; anyone else 
 | `/list`                       | List which endpoints have a saved payload available for replay              |
 | `/selftest`                   | Replay saved payloads on every endpoint, report ✅ / ❌ / ⚠️ + timing per ep |
 | `/selftest <endpoint>`        | Replay a single endpoint, e.g. `/selftest predict_voice_ahh`                |
-| `/restart`                    | Restart the Docker container now (sends `🔄 Restarting…` then comes back up via `restart: unless-stopped`) |
+| `/lasthour`                   | On-demand bar chart of calls + success% per endpoint for the last 60 minutes |
+| `/total`                      | Bar chart of success% per endpoint **since the last reset** (or container start) |
+| `/resetstats`                 | Zero the success-rate counters now (the 20:00 daily summary also resets them) |
+| `/restart`                    | Trigger an immediate Docker container restart (same flow as the 00:00 cron)  |
 
 ### How saved payloads work
 

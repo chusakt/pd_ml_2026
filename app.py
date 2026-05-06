@@ -209,17 +209,27 @@ TRACKED_ENDPOINTS = [
 # payloads for these are raw bytes, replayed via test_client form-data.
 FILE_UPLOAD_ENDPOINTS = {'predict_voice_ahh_mp3', 'predict_voice_ypl_mp3'}
 
+# Endpoints that take JSON `{"data": "<base64-encoded WAV>", ...}`. We save just
+# the decoded audio bytes (smaller on disk, strips PII metadata), and on replay
+# re-encode and wrap them back into `{"data": "..."}`.
+BASE64_AUDIO_JSON_ENDPOINTS = {'predict_voice_ahh', 'predict_voice_ypl'}
+
 # --- Saved-payload self-test ---
 # Each successful prediction saves its request payload to TEST_PAYLOADS_DIR,
 # overwriting any previous one for that endpoint. /selftest (and the Telegram
 # /selftest command) replays those payloads through the live app's test client
 # to verify each endpoint still produces a valid prediction.
 TEST_PAYLOADS_DIR = os.getenv('TEST_PAYLOADS_DIR', '/app/test_payloads')
+ERROR_PAYLOADS_DIR = os.path.join(TEST_PAYLOADS_DIR, 'filescauseerror')
 SELFTEST_HEADER = 'X-Selftest-Run'  # marker to skip counters during self-test
 try:
     os.makedirs(TEST_PAYLOADS_DIR, exist_ok=True)
 except Exception as e:
     print(f"Could not create {TEST_PAYLOADS_DIR}: {e}")
+try:
+    os.makedirs(ERROR_PAYLOADS_DIR, exist_ok=True)
+except Exception as e:
+    print(f"Could not create {ERROR_PAYLOADS_DIR}: {e}")
 
 
 def _save_test_payload(endpoint: str, kind: str, data) -> None:
@@ -245,15 +255,69 @@ def _save_test_payload(endpoint: str, kind: str, data) -> None:
         print(f"Failed to save test payload for {endpoint}: {e}")
 
 
+MAX_ERROR_PAYLOADS_PER_ENDPOINT = 10
+
+
+def _save_error_payload(endpoint: str, kind: str, data, error_msg: str = '') -> None:
+    """Persist the incoming payload that caused a processing error.
+
+    Keeps at most MAX_ERROR_PAYLOADS_PER_ENDPOINT files per endpoint.
+    When the limit is reached, the oldest file for that endpoint is deleted.
+    kind='json' → data is a dict (or raw string), written as UTF-8 JSON.
+    kind='file' → data is raw bytes, written as a binary blob.
+    """
+    try:
+        os.makedirs(ERROR_PAYLOADS_DIR, exist_ok=True)
+
+        from datetime import datetime as _dt
+        ts = _dt.utcnow().strftime('%Y%m%d_%H%M%S')
+        ext = 'json' if kind == 'json' else 'bin'
+        fname = f"{endpoint}_{ts}.{ext}"
+        path = os.path.join(ERROR_PAYLOADS_DIR, fname)
+
+        # Find existing error files for this endpoint and enforce limit
+        existing = sorted(
+            f for f in os.listdir(ERROR_PAYLOADS_DIR)
+            if f.startswith(endpoint + '_')
+        )
+        while len(existing) >= MAX_ERROR_PAYLOADS_PER_ENDPOINT:
+            oldest = existing.pop(0)
+            try:
+                os.remove(os.path.join(ERROR_PAYLOADS_DIR, oldest))
+            except OSError:
+                pass
+
+        # Write the new error payload
+        tmp = path + ".tmp"
+        if kind == 'json':
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump({'payload': data, 'error': error_msg}, f)
+        else:
+            # kind='file': data might be None if request body was unreadable
+            if data is None:
+                data = b''
+            elif isinstance(data, str):
+                data = data.encode('utf-8')
+            with open(tmp, 'wb') as f:
+                f.write(data)
+        os.replace(tmp, path)
+    except Exception as e:
+        print(f"Failed to save error payload for {endpoint}: {e}")
+
+
 def run_selftest(target=None) -> dict:
     """Replay saved payloads through Flask's test client. Returns per-endpoint dict.
 
-    target=None → run every TRACKED_ENDPOINTS.
-    target='predict_voice_ahh' → just that one.
+    target=None → run every TRACKED_ENDPOINTS except mp3 file-upload endpoints
+                  (replay is flaky there; run them explicitly if you need to).
+    target='predict_voice_ahh' → just that one (any endpoint, including mp3).
     """
     import time as _time
     import io
-    targets = [target] if target else list(TRACKED_ENDPOINTS)
+    if target:
+        targets = [target]
+    else:
+        targets = [ep for ep in TRACKED_ENDPOINTS if ep not in FILE_UPLOAD_ENDPOINTS]
     results = {}
     client = app.test_client()
     headers = {SELFTEST_HEADER: '1'}
@@ -266,9 +330,10 @@ def run_selftest(target=None) -> dict:
             continue
 
         is_file = ep in FILE_UPLOAD_ENDPOINTS
+        is_b64_audio = ep in BASE64_AUDIO_JSON_ENDPOINTS
         path = os.path.join(
             TEST_PAYLOADS_DIR,
-            f"{ep}.bin" if is_file else f"{ep}.json",
+            f"{ep}.bin" if (is_file or is_b64_audio) else f"{ep}.json",
         )
         if not os.path.exists(path):
             results[ep] = {'status': 'no_payload'}
@@ -285,6 +350,11 @@ def run_selftest(target=None) -> dict:
                     content_type='multipart/form-data',
                     headers=headers,
                 )
+            elif is_b64_audio:
+                with open(path, 'rb') as f:
+                    audio_bytes = f.read()
+                body = {'data': base64.b64encode(audio_bytes).decode('ascii')}
+                resp = client.post(f'/{ep}', json=body, headers=headers)
             else:
                 with open(path, 'r', encoding='utf-8') as f:
                     body = json.load(f)
@@ -364,6 +434,7 @@ def send_chart_summary():
             # No traffic last hour; reset (defensive) and skip the message.
             try:
                 redis_conn.delete('endpoint_success_counts', 'endpoint_fail_counts')
+                redis_conn.set('endpoint_counts_reset_at', now.isoformat())
             except Exception:
                 pass
             print(f"Chart summary: no calls since last reset, skipping send")
@@ -392,11 +463,212 @@ def send_chart_summary():
 
         try:
             redis_conn.delete('endpoint_success_counts', 'endpoint_fail_counts')
+            redis_conn.set('endpoint_counts_reset_at', now.isoformat())
         except Exception:
             pass
         print(f"Chart summary sent at {now}: total={grand_total}, success_rate={grand_rate:.1f}%")
     except Exception as e:
         print(f"Error sending chart summary: {e}")
+
+
+def send_last_hour_summary():
+    """Send a per-endpoint call/success summary for the trailing 60 minutes.
+
+    Reads per-minute buckets written by `track_endpoint_success`. Read-only —
+    does NOT reset any counters (the daily 20:00 summary still owns the reset).
+    """
+    try:
+        import time as _t
+        TH_TZ = timezone(timedelta(hours=7))
+        now = datetime.now(TH_TZ)
+
+        current_minute = int(_t.time()) // 60
+        # Last 60 full minutes, ending at current_minute - 1 (skip the
+        # in-progress minute so the window is stable).
+        keys = [
+            f"endpoint_counts_minute:{current_minute - i}"
+            for i in range(1, 61)
+        ]
+        pipe = redis_conn.pipeline(transaction=False)
+        for k in keys:
+            pipe.hgetall(k)
+        buckets = pipe.execute()
+
+        succ = {ep: 0 for ep in TRACKED_ENDPOINTS}
+        fail = {ep: 0 for ep in TRACKED_ENDPOINTS}
+        for h in buckets:
+            if not h:
+                continue
+            for raw_field, raw_val in h.items():
+                field = raw_field.decode() if isinstance(raw_field, bytes) else raw_field
+                try:
+                    val = int(raw_val)
+                except (TypeError, ValueError):
+                    continue
+                if ':' not in field:
+                    continue
+                ep, kind = field.rsplit(':', 1)
+                if ep not in succ:
+                    continue
+                if kind == 's':
+                    succ[ep] += val
+                elif kind == 'f':
+                    fail[ep] += val
+
+        # Exclude mp3 file-upload endpoints — they're replayed less reliably
+        # and the user wants them out of both the per-row chart and the totals.
+        rows = []
+        max_total = 0
+        grand_succ = 0
+        grand_total = 0
+        for ep in TRACKED_ENDPOINTS:
+            if ep in FILE_UPLOAD_ENDPOINTS:
+                continue
+            s = succ[ep]
+            f = fail[ep]
+            t = s + f
+            rate = (s / t * 100) if t else 0
+            rows.append((ep, s, t, rate))
+            if t > max_total:
+                max_total = t
+            grand_succ += s
+            grand_total += t
+
+        if grand_total == 0:
+            send_telegram_message(
+                f"📊 รายงาน 60 นาทีที่ผ่านมา\n"
+                f"📅 {now.strftime('%Y-%m-%d %H:%M')} (เวลาไทย)\n"
+                f"ไม่มีคำขอเรียกเข้ามาในชั่วโมงที่ผ่านมา"
+            )
+            return
+
+        BAR_WIDTH = 18
+        chart_lines = []
+        for ep, s, t, rate in rows:
+            short = ep.replace('predict_', '')
+            bar_len = round((t / max_total) * BAR_WIDTH) if max_total else 0
+            bar = '█' * bar_len + '·' * (BAR_WIDTH - bar_len)
+            chart_lines.append(f"{short:<14} {bar} {t:>3} ({rate:>5.1f}%)")
+
+        grand_rate = (grand_succ / grand_total * 100) if grand_total else 0
+        text = (
+            f"📊 รายงาน 60 นาทีที่ผ่านมา\n"
+            f"📅 {now.strftime('%Y-%m-%d %H:%M')} (เวลาไทย)\n"
+            f"```\n"
+            + "\n".join(chart_lines)
+            + f"\n```\n"
+            f"รวม: {grand_total} ครั้ง • success {grand_rate:.1f}%"
+        )
+        send_telegram_message(text, parse_mode='Markdown')
+    except Exception as e:
+        print(f"Error sending last-hour summary: {e}")
+        try:
+            send_telegram_message(f"Last-hour summary failed: {e}")
+        except Exception:
+            pass
+
+
+def send_total_summary():
+    """Send the per-endpoint success-rate chart since the last reset.
+
+    Reads `endpoint_success_counts` / `endpoint_fail_counts` (the same hashes
+    the 20:00 daily summary consumes-and-resets). Read-only. mp3 file-upload
+    endpoints are excluded from rows AND the grand total, matching /lasthour.
+    """
+    try:
+        TH_TZ = timezone(timedelta(hours=7))
+        now = datetime.now(TH_TZ)
+
+        success = redis_conn.hgetall('endpoint_success_counts') or {}
+        failure = redis_conn.hgetall('endpoint_fail_counts') or {}
+        reset_at_raw = redis_conn.get('endpoint_counts_reset_at')
+
+        def _get(d, key):
+            return int(d.get(key.encode(), d.get(key, 0)))
+
+        rows = []
+        max_total = 0
+        grand_succ = 0
+        grand_total = 0
+        for ep in TRACKED_ENDPOINTS:
+            if ep in FILE_UPLOAD_ENDPOINTS:
+                continue
+            s = _get(success, ep)
+            f = _get(failure, ep)
+            t = s + f
+            rate = (s / t * 100) if t else 0
+            rows.append((ep, s, t, rate))
+            if t > max_total:
+                max_total = t
+            grand_succ += s
+            grand_total += t
+
+        if reset_at_raw:
+            since_str = reset_at_raw.decode() if isinstance(reset_at_raw, bytes) else reset_at_raw
+            try:
+                since_str = datetime.fromisoformat(since_str).strftime('%Y-%m-%d %H:%M')
+            except Exception:
+                pass
+        else:
+            since_str = "container start"
+
+        if grand_total == 0:
+            send_telegram_message(
+                f"📊 รวมตั้งแต่รีเซ็ตล่าสุด\n"
+                f"📅 {now.strftime('%Y-%m-%d %H:%M')} (เวลาไทย)\n"
+                f"ตั้งแต่: {since_str}\n"
+                f"ไม่มีคำขอเรียกเข้ามาตั้งแต่รีเซ็ตล่าสุด"
+            )
+            return
+
+        BAR_WIDTH = 18
+        chart_lines = []
+        for ep, s, t, rate in rows:
+            short = ep.replace('predict_', '')
+            bar_len = round((t / max_total) * BAR_WIDTH) if max_total else 0
+            bar = '█' * bar_len + '·' * (BAR_WIDTH - bar_len)
+            chart_lines.append(f"{short:<14} {bar} {t:>3} ({rate:>5.1f}%)")
+
+        grand_rate = (grand_succ / grand_total * 100) if grand_total else 0
+        text = (
+            f"📊 รวมตั้งแต่รีเซ็ตล่าสุด\n"
+            f"📅 {now.strftime('%Y-%m-%d %H:%M')} (เวลาไทย)\n"
+            f"ตั้งแต่: {since_str}\n"
+            f"```\n"
+            + "\n".join(chart_lines)
+            + f"\n```\n"
+            f"รวม: {grand_total} ครั้ง • success {grand_rate:.1f}%"
+        )
+        send_telegram_message(text, parse_mode='Markdown')
+    except Exception as e:
+        print(f"Error sending total summary: {e}")
+        try:
+            send_telegram_message(f"Total summary failed: {e}")
+        except Exception:
+            pass
+
+
+def reset_success_counters():
+    """Zero the daily success/fail hashes and stamp a fresh reset timestamp.
+
+    Does NOT touch per-minute buckets used by /lasthour — those auto-expire
+    after ~70 minutes and clearing them would require a key scan.
+    """
+    try:
+        TH_TZ = timezone(timedelta(hours=7))
+        now = datetime.now(TH_TZ)
+        redis_conn.delete('endpoint_success_counts', 'endpoint_fail_counts')
+        redis_conn.set('endpoint_counts_reset_at', now.isoformat())
+        send_telegram_message(
+            f"♻️ รีเซ็ตตัวนับ success rate แล้ว\n"
+            f"📅 {now.strftime('%Y-%m-%d %H:%M')} (เวลาไทย)"
+        )
+    except Exception as e:
+        print(f"Error resetting counters: {e}")
+        try:
+            send_telegram_message(f"Reset failed: {e}")
+        except Exception:
+            pass
 
 
 def _chart_summary_scheduler():
@@ -544,6 +816,9 @@ _TG_HELP = (
     "/selftest — replay saved payloads on every endpoint\n"
     "/selftest <endpoint> — replay just one (e.g. predict_voice_ahh)\n"
     "/list — show which endpoints have a saved payload\n"
+    "/lasthour — success rate per endpoint over the last 60 minutes\n"
+    "/total — success rate per endpoint since the last reset\n"
+    "/resetstats — zero the success-rate counters now\n"
     "/restart — restart the Docker container now\n"
     "/help — this help"
 )
@@ -588,6 +863,12 @@ def _handle_telegram_command(text: str):
             send_telegram_message("No saved test payloads yet.")
         else:
             send_telegram_message("Saved payloads:\n" + "\n".join(files))
+    elif cmd in ('/lasthour', '/hour'):
+        threading.Thread(target=send_last_hour_summary, daemon=True).start()
+    elif cmd in ('/total', '/sincestart'):
+        threading.Thread(target=send_total_summary, daemon=True).start()
+    elif cmd in ('/resetstats', '/resetrate'):
+        threading.Thread(target=reset_success_counters, daemon=True).start()
     elif cmd in ('/help', '/start'):
         send_telegram_message(_TG_HELP)
     else:
@@ -763,16 +1044,30 @@ def track_endpoint_success(response):
 
         try:
             bucket = 'endpoint_success_counts' if is_success else 'endpoint_fail_counts'
-            redis_conn.hincrby(bucket, endpoint_name, 1)
+            # Per-minute bucket lets /lasthour sum a 60-minute sliding window.
+            # Field naming: "<endpoint>:s" / "<endpoint>:f". TTL > 60 min so a
+            # request near the end of a minute can't expire its own bucket
+            # before the window query reads it.
+            import time as _t
+            minute_key = f"endpoint_counts_minute:{int(_t.time()) // 60}"
+            field = f"{endpoint_name}:{'s' if is_success else 'f'}"
+            pipe = redis_conn.pipeline(transaction=False)
+            pipe.hincrby(bucket, endpoint_name, 1)
+            pipe.hincrby(minute_key, field, 1)
+            pipe.expire(minute_key, 4200)
+            pipe.execute()
         except Exception:
             pass
 
         # Save the newest successful JSON payload for self-test replay.
-        # File-upload endpoints save themselves inside the route because the
-        # multipart stream is consumed by the time we get here.
+        # File-upload and base64-audio endpoints save themselves inside the
+        # route — file-upload because the multipart stream is consumed by the
+        # time we get here, base64-audio so we can store just the decoded
+        # bytes instead of the full JSON wrapper.
         if (
             is_success
             and endpoint_name not in FILE_UPLOAD_ENDPOINTS
+            and endpoint_name not in BASE64_AUDIO_JSON_ENDPOINTS
             and request.is_json
         ):
             try:
@@ -896,6 +1191,7 @@ def predict_questionaire():
 
     except Exception as e:
         report_route_error('predict_questionaire', e)
+        _save_error_payload('predict_questionaire', 'json', request.get_json(silent=True), str(e))
         return jsonify({"error": str(e), "prediction": "2"})
 
 
@@ -1066,6 +1362,7 @@ def predict_dualtap():
 
     except Exception as e:
         report_route_error('predict_dualtap', e)
+        _save_error_payload('predict_dualtap', 'json', request.get_json(silent=True), str(e))
         return jsonify({"error": str(e), "prediction": "2"})
 
 
@@ -1258,6 +1555,7 @@ def predict_pinchtosize():
 
     except Exception as e:
         report_route_error('predict_pinchtosize', e)
+        _save_error_payload('predict_pinchtosize', 'json', request.get_json(silent=True), str(e))
         return jsonify({"error": str(e), "prediction": "2"})
 
 # Sampling rate (10 Hz)
@@ -1380,7 +1678,9 @@ def predict_tremor():
         return jsonify(response)
 
     except Exception as e:
-        report_route_error(request.path.lstrip('/') or 'predict_tremor', e)
+        ep_name = request.path.lstrip('/') or 'predict_tremor'
+        report_route_error(ep_name, e)
+        _save_error_payload(ep_name, 'json', request.get_json(silent=True), str(e))
         return jsonify({"error": str(e), "prediction": "2"})
 
 
@@ -1528,6 +1828,18 @@ def predict_voice():
         response = {
             "prediction": str(y_pred[0]),
         }
+
+        # Save the decoded audio bytes as the latest payload for self-test
+        # replay (skip on selftest runs to avoid recursion). We persist raw
+        # bytes rather than the full JSON wrapper so the file is smaller and
+        # contains no PII fields.
+        if request.headers.get(SELFTEST_HEADER) != '1':
+            try:
+                with open(temp_wav_file, 'rb') as _f:
+                    _save_test_payload(request.path.lstrip('/'), 'file', _f.read())
+            except Exception:
+                pass
+
         # Increment successful request counter
         successful_request_count += 1
 
@@ -1543,7 +1855,9 @@ def predict_voice():
         return jsonify(response)
 
     except Exception as e:
-        report_route_error(request.path.lstrip('/') or 'predict_voice', e)
+        ep_name = request.path.lstrip('/') or 'predict_voice'
+        report_route_error(ep_name, e)
+        _save_error_payload(ep_name, 'file', request.get_data(cache=True), str(e))
         return jsonify({"error": str(e), "prediction": "2"})
     finally:
         # Ensure the temporary WAV file is deleted after processing
@@ -1623,7 +1937,17 @@ def predict_voice_mp3():
         return jsonify({"prediction": str(y_pred[0])})
 
     except Exception as e:
-        report_route_error(request.path.lstrip('/') or 'predict_voice_mp3', e)
+        ep_name = request.path.lstrip('/') or 'predict_voice_mp3'
+        report_route_error(ep_name, e)
+        # Save the uploaded file that caused the error
+        try:
+            if temp_folder and os.path.exists(os.path.join(temp_folder, "uploaded.mp3")):
+                with open(os.path.join(temp_folder, "uploaded.mp3"), 'rb') as _ef:
+                    _save_error_payload(ep_name, 'file', _ef.read(), str(e))
+            else:
+                _save_error_payload(ep_name, 'file', request.get_data(cache=True), str(e))
+        except Exception:
+            pass
         return jsonify({"error": str(e), "prediction": "2"}), 400
     finally:
         # Always clean up — on success AND on every error path. Otherwise
@@ -1670,6 +1994,7 @@ def predict_voting():
 
     except Exception as e:
         report_route_error('predict_voting', e)
+        _save_error_payload('predict_voting', 'json', request.get_json(silent=True), str(e))
         return jsonify({"error": str(e), "prediction": "2"})
 
 
